@@ -94,6 +94,7 @@ void InduceSeq::run_simulation(int cell_number, int groupTID, int threadID, int 
     find_DSBs(parameter.get_dsb_threshold(), groupTID);
     get_blunted_ends(groupTID);
     get_dsb_fragments(groupTID, threadID);
+    filter_fragments_size(groupTID);
     filter_dsb_strands_ssd(groupTID);
     find_base_pair_damages(groupTID);
     generate_simulation_output(cell_number, groupTID, NumWorkerThreads, threadIDOffset);
@@ -107,8 +108,8 @@ void InduceSeq::set_genome_data(std::string& tempFolderPath) {
     std::string genomeTemplatePath = tempFolderPath+"/genome_spaceless.fa";                                       
     genome_fasta_size = static_cast<size_t>(ref_genomeFile_size*2);                                           // The size of an Undamaged file is estimated to be 2 times the size of the reference sequence file
     genome_fasta = createMemoryMappedFile(genomeTemplatePath, genome_fasta_size);                                     // Generate a memory-map placeholder to store the memory map of the undamaged fasta file as it gets created later
-    buildUndamagedGenomeTemplate_ForwardOnly_MM(genome_fasta, genome_fasta_size, sdd_data.get_num_chrom(), sdd_data.get_chrom_mapping(), parameter.get_reference_genome(), cum_chrom_header_sizes, *sdd_data.get_chrom_size_bp());
-    if (calculateCumChromHeaderSizes(cum_chrom_header_sizes, chrom_headers, genome_fasta, *sdd_data.get_chrom_end_loc())) {
+    buildUndamagedGenomeTemplate_ForwardOnly_MM(genome_fasta, genome_fasta_size, sdd_data.get_num_chrom(), sdd_data.get_chrom_mapping(), parameter.get_reference_genome(), cum_chrom_header_sizes);
+    if (calculateCumChromHeaderSizes(cum_chrom_header_sizes, chrom_headers, genome_fasta, genome_fasta_size, *sdd_data.get_chrom_end_loc())) {
         std::cerr<<"\n ERROR: The chromosome sizes listed in the sdd file do not match the chromosome sizes in the genome fasta file " << parameter.get_reference_genome();
         exit(EXIT_FAILURE);
     }
@@ -118,12 +119,31 @@ void InduceSeq::set_genome_data(std::string& tempFolderPath) {
 // DSBthreshold is the maximum distance between a pair of strand breaks for them to qualify as a dsb. 
 // ssd_data should have its backbone break vectors initialized and sorted least position to greatest position before this function is called
 void InduceSeq::find_DSBs(int DSBthreshold, int groupTID){
-    std::vector<long>& backbone1_breaks = sdd_data.get_backbone1_break_loc(groupTID);
-    std::vector<long>& backbone2_breaks = sdd_data.get_backbone2_break_loc(groupTID);
+    const std::vector<long>& chromEnds = *sdd_data.get_chrom_end_loc();                                         // chrom_end_loc is sorted in ascending order
+
+    // Each chromosome is a separate, already-blunted DNA molecule, so both backbones "break" at its two physical
+    // ends. chromEnds itself already lists exactly these boundary positions (num_chrom+1 of them): position 0 is
+    // the start of the first chromosome, chromEnds.back() is the end of the last chromosome, and each entry in
+    // between is simultaneously the end of one chromosome and the start of the next, since global coordinates run
+    // contiguously across the chromosome boundary. These are merged into local copies of the backbone break lists
+    // (both real ssd breaks and chromEnds are already sorted ascending, so a linear merge keeps the result sorted)
+    // so that the dsb-finding logic below, completely unmodified, can also find dsbs formed between a chromosome
+    // boundary and a nearby real break. The original break vectors held by sdd_data are left untouched, since
+    // later steps (e.g. filter_dsb_strands_ssd) read them again expecting only genuine ssd breaks.
+    std::vector<long>& real_backbone1_breaks = sdd_data.get_backbone1_break_loc(groupTID);
+    std::vector<long>& real_backbone2_breaks = sdd_data.get_backbone2_break_loc(groupTID);
+
+    std::vector<long> backbone1_breaks;
+    backbone1_breaks.reserve(real_backbone1_breaks.size() + chromEnds.size());
+    std::merge(real_backbone1_breaks.begin(), real_backbone1_breaks.end(), chromEnds.begin(), chromEnds.end(), std::back_inserter(backbone1_breaks));
+
+    std::vector<long> backbone2_breaks;
+    backbone2_breaks.reserve(real_backbone2_breaks.size() + chromEnds.size());
+    std::merge(real_backbone2_breaks.begin(), real_backbone2_breaks.end(), chromEnds.begin(), chromEnds.end(), std::back_inserter(backbone2_breaks));
+
     std::vector<long>::iterator site1 = backbone1_breaks.begin();
 	std::vector<long>::iterator site2 = backbone2_breaks.begin();
-    const std::vector<long>& chromEnds = *sdd_data.get_chrom_end_loc();                                         // chrom_end_loc is sorted in ascending order
-    
+
     // variable to keep track of whether the previous step in the while loop was a dsb
     // used for keeping track of dsbs that are part of interconnected dsb, as explained below
     bool prevStepDSB = 0;
@@ -136,20 +156,21 @@ void InduceSeq::find_DSBs(int DSBthreshold, int groupTID){
         //     std::cout << "site 1: " << *site1 << ",  site 2: " << *site2 << "\n";
         // }
 		bool isDSB{0};                                                                                  // initiating with zero
-        long chromIdx1;
         if(abs(siteDiff) <= DSBthreshold){
-            // finds the index of 
-            chromIdx1 = std::upper_bound(chromEnds.begin(), chromEnds.end(), *site1) - chromEnds.begin() - 1;  // index of the largest chromEnds element <= *site1 (binary search since chromEnds is sorted)
-            long chromIdx2 = std::upper_bound(chromEnds.begin(), chromEnds.end(), *site2) - chromEnds.begin() - 1;
+            // Chromosome identity itself is not kept: it is only needed transiently here, to check that the two
+            // sites fall in the same interval (get_chrom_idx is the same binary search used wherever a chromosome
+            // index is actually needed downstream, e.g. generate_simulation_output).
+            long chromIdx1 = get_chrom_idx(*site1);
+            long chromIdx2 = get_chrom_idx(*site2);
             isDSB = (chromIdx1 == chromIdx2);                                                          // same chromosome if both sites fall in the same interval
         }
 
         if(isDSB){
             // std::cout << "loc: " << *site1 << "\n";
             // save dsb to data vector
-            dsb_locations[groupTID].push_back({*site1, *site2, chromIdx1, prevStepDSB});
+            dsb_locations[groupTID].push_back({*site1, *site2, prevStepDSB});
 
-            
+
             // One site is incremented, to move onto the next strand break. The choice of which site to increment has the form below for the following reason. 
             // Consider the strand breaks as nodes in a graph, with an edge between any two breaks that satifsy the distance criterion for a dsb. 
             // If dsbs are all isolated, then the graph is a set of 2-node connected components, and no special consideration is needed.
@@ -190,9 +211,19 @@ void InduceSeq::find_DSBs(int DSBthreshold, int groupTID){
     // for (size_t i = 0; i < dsbs.size(); i++) {
     //     std::cout << "  [" << i << "] backbone1=" << dsbs[i][0]
     //               << "  backbone2=" << dsbs[i][1]
-    //               << "  chrom="    << dsbs[i][2]
-    //               << "  prevDSB="  << dsbs[i][3] << "\n";
+    //               << "  prevDSB="  << dsbs[i][2] << "\n";
     // }
+}
+
+// Returns the 0-based index of the chromosome that a global bp position falls within, via binary search over
+// chrom_end_loc. Chromosome c owns positions chrom_end_loc[c]+1 .. chrom_end_loc[c+1] inclusive (matching the
+// convention used everywhere else, e.g. chrom_start/chrom_end in the fragment-generation code), so this looks
+// for the smallest chrom_end_loc entry that is >= position rather than the largest one that is <= position:
+// a position exactly on a chromosome boundary is that chromosome's own last base, not the next chromosome's
+// first. This is the only place chromosome identity is derived from a position outside of find_DSBs.
+int InduceSeq::get_chrom_idx(long position) {
+    const std::vector<long>& chromEnds = *sdd_data.get_chrom_end_loc();
+    return std::lower_bound(chromEnds.begin(), chromEnds.end(), position) - chromEnds.begin() - 1;
 }
 
 void InduceSeq::close() {
@@ -202,24 +233,26 @@ void InduceSeq::close() {
 void InduceSeq::get_blunted_ends(int groupTID) {
     dsb_blunted_ends[groupTID].clear();
     std::vector<std::vector<long>> dsb_locs = get_dsb_locations(groupTID);
-    // dsb_blunted ends is in the form {location of base on the left edge, location of base on the right edge, chromosome index,
+    // dsb_blunted ends is in the form {location of base on the left edge, location of base on the right edge,
     // strand1 (backbone1) location of the dsb that caused the left edge, strand2 (backbone2) location of the dsb that caused the left edge,
     // strand1 (backbone1) location of the dsb that caused the right edge, strand2 (backbone2) location of the dsb that caused the right edge}
     // A cluster of chained/connected dsbs can have the left edge caused by a different dsb than the right edge, so both are tracked separately.
-    // base locations start at 1, and chromosome indices at 0
-    std::vector<long> new_dsb_blunted_ends = {0, 0, 0, 0, 0, 0, 0};
+    // Chromosome identity is deliberately not tracked here: find_DSBs treats every chromosome boundary as a break on both strands, so a
+    // boundary always shows up as an ordinary entry in dsb_locs, indistinguishable from a genuine dsb as far as this function is concerned
+    // (see get_dsb_fragments for how that is enough, on its own, to keep fragments from crossing a chromosome boundary).
+    // base locations start at 1
+    std::vector<long> new_dsb_blunted_ends = {0, 0, 0, 0, 0, 0};
     for (size_t i = 0; i < dsb_locs.size(); i++) {
         std::vector<long> dsb = dsb_locs[i];
-        if (dsb[3] == 0) {
+        if (dsb[2] == 0) {
             new_dsb_blunted_ends[0] = dsb[1];
-            new_dsb_blunted_ends[3] = dsb[0];                                     // strand1 location of the dsb that starts this cluster (causes the left edge)
-            new_dsb_blunted_ends[4] = dsb[1];                                     // strand2 location of the dsb that starts this cluster (causes the left edge)
+            new_dsb_blunted_ends[2] = dsb[0];                                     // strand1 location of the dsb that starts this cluster (causes the left edge)
+            new_dsb_blunted_ends[3] = dsb[1];                                     // strand2 location of the dsb that starts this cluster (causes the left edge)
         }
-        if (i + 1 == dsb_locs.size() || dsb_locs[i+1][3] == 0) {
+        if (i + 1 == dsb_locs.size() || dsb_locs[i+1][2] == 0) {
             new_dsb_blunted_ends[1] = dsb_locs[i][0] + 1;
-            new_dsb_blunted_ends[2] = dsb_locs[i][2];
-            new_dsb_blunted_ends[5] = dsb_locs[i][0];                             // strand1 location of the dsb that closes this cluster (causes the right edge)
-            new_dsb_blunted_ends[6] = dsb_locs[i][1];                             // strand2 location of the dsb that closes this cluster (causes the right edge)
+            new_dsb_blunted_ends[4] = dsb_locs[i][0];                             // strand1 location of the dsb that closes this cluster (causes the right edge)
+            new_dsb_blunted_ends[5] = dsb_locs[i][1];                             // strand2 location of the dsb that closes this cluster (causes the right edge)
             dsb_blunted_ends[groupTID].push_back(new_dsb_blunted_ends);
         }
     }
@@ -228,75 +261,103 @@ void InduceSeq::get_blunted_ends(int groupTID) {
     // std::cout << "Blunted ends for groupTID=" << groupTID << " (" << blunted.size() << " entries):\n";
     // for (size_t i = 0; i < blunted.size(); i++) {
     //     std::cout << "  [" << i << "] left=" << blunted[i][0]
-    //               << "  right=" << blunted[i][1]
-    //               << "  chrom=" << blunted[i][2] << "\n";
+    //               << "  right=" << blunted[i][1] << "\n";
     // }
 }
 
 //DDDD
-//AAAA add edge cases dsb near each other
 void InduceSeq::get_dsb_fragments(int groupTID, int threadID) {
     dsb_fragments_left[groupTID].clear();
     dsb_fragments_right[groupTID].clear();
 
-    // State carried over from the previous dsb's right fragment, so the current dsb's left fragment
-    // can be checked against it for overlap. previous_chrom_idx starts at -1 (never a valid chrom index)
-    // so the very first dsb is never mistakenly treated as overlapping with a "previous" fragment.
+    // Chromosome identity is never tracked here. find_DSBs treats every chromosome boundary as a break on both
+    // strands, so a boundary always shows up as an ordinary entry in dsb_blunted_ends, exactly like a real dsb -
+    // the same overlap handling below that keeps two neighbouring fragments from encroaching on each other
+    // therefore also keeps a fragment from crossing into the next chromosome, with no need to know where
+    // chromosome boundaries fall. The only thing that is special-cased is the two ends of the whole genome: the
+    // very first entry always originates (at least in part) from the break at the start of the genome, and the
+    // very last entry always originates from the break at its end (both breaks are unconditionally present, and
+    // are respectively the smallest and largest possible break position), so those two never grow a fragment on
+    // the side that would run off the genome.
+    const std::vector<std::vector<long>>& blunted_ends = dsb_blunted_ends[groupTID];
+
+    // State carried over from the previous entry's right fragment, so the current entry's left fragment
+    // can be checked against it for overlap.
     long previous_right_start = 0;
     long previous_right_end = 0;
-    int previous_chrom_idx = -1;
     long previous_right_dsb_strand1 = 0;                                            // The right-causing dsb's strand1/strand2 locations for the previous blunted end,
     long previous_right_dsb_strand2 = 0;                                            // carried over in case the previous dsb's right fragment needs to be re-pushed after an overlap merge
-    bool previous_right_appended = false;                                          // Whether the previous dsb's right fragment is currently the last element of dsb_fragments_right[groupTID]
+    bool previous_right_appended = false;                                          // Whether the previous entry's right fragment is currently the last element of dsb_fragments_right[groupTID]
 
-    // Set by the right-fragment check below when dsb i's right fragment runs into dsb i+1's left
-    // blunted end, so that dsb i+1's left fragment is skipped entirely on the next loop iteration.
+    // Set by the right-fragment check below when entry i's right fragment runs into entry i+1's left
+    // blunted end, so that entry i+1's left fragment is skipped entirely on the next loop iteration.
     bool skip_left_fragment = false;
 
     size_t i = 0;
-    while (i < dsb_blunted_ends[groupTID].size()) {
-        std::vector<long> dsb_blunted_end = dsb_blunted_ends[groupTID][i];
-        int chrom_idx = dsb_blunted_end[2];
-        long left_dsb_strand1 = dsb_blunted_end[3];                                // strand1 location of the dsb that caused the left edge
-        long left_dsb_strand2 = dsb_blunted_end[4];                                // strand2 location of the dsb that caused the left edge
-        long right_dsb_strand1 = dsb_blunted_end[5];                               // strand1 location of the dsb that caused the right edge
-        long right_dsb_strand2 = dsb_blunted_end[6];                               // strand2 location of the dsb that caused the right edge
+    while (i < blunted_ends.size()) {
+        const std::vector<long>& dsb_blunted_end = blunted_ends[i];
+        long left_dsb_strand1 = dsb_blunted_end[2];                                // strand1 location of the dsb that caused the left edge
+        long left_dsb_strand2 = dsb_blunted_end[3];                                // strand2 location of the dsb that caused the left edge
+        long right_dsb_strand1 = dsb_blunted_end[4];                               // strand1 location of the dsb that caused the right edge
+        long right_dsb_strand2 = dsb_blunted_end[5];                               // strand2 location of the dsb that caused the right edge
 
-        bool skip_this_left_fragment = skip_left_fragment;                         // Capture the flag set by the previous iteration before resetting it for this one
+        bool skip_this_left_fragment = skip_left_fragment || i == 0;               // Capture the flag set by the previous iteration; the very start of the genome never grows a left fragment
         skip_left_fragment = false;
 
         int fragment_length = get_random_fragment_length(threadID) - parameter.get_P5_adapter_length();
         if (fragment_length > 1 && !skip_this_left_fragment) {
             long left_start = dsb_blunted_end[0];
             long left_end = left_start - fragment_length + 1;
-            int chrom_start = (*sdd_data.get_chrom_end_loc())[chrom_idx] + 1;
             bool drop_current_left = false;
-            if (left_end < chrom_start) {
-                left_end = chrom_start;
-            } else if (previous_right_appended && chrom_idx == previous_chrom_idx && left_end < previous_right_end) {
-                // The current left fragment overlaps with the previous dsb's right fragment.
-                long overlap = previous_right_end - left_end;                      // How far the two fragments overlap
-                long blunted_end_gap = left_start - previous_right_start;          // Raw distance between the two dsb break points (not the fragment ends)
-                if (overlap > parameter.get_maximum_overlap_fragment_generation() * (blunted_end_gap + 2*parameter.get_P5_adapter_length())) {
-                    // Overlap is large; the section in between these two DSBs is taken to not have been fragmented. No reads produced from this fragment, since it contains 2 P5 adapters. 
-                    // right fragment that was already pushed, and skip pushing the current left fragment.
-                    dsb_fragments_right[groupTID].pop_back();
-                    drop_current_left = true;
-                } else {
-                    // Overlap is small enough to salvage: both fragments are shortened to meet at the midpoint of their two ends.
-                    long merged_end = static_cast<long>(0.5 * (left_end + previous_right_end));
-                    left_end = merged_end;
+            if (left_end < previous_right_end) {
+                if (previous_right_appended) {
+                    // The current left fragment overlaps with the previous entry's right fragment.
+                    long overlap = previous_right_end - left_end;                      // How far the two fragments overlap
+                    long blunted_end_gap = left_start - previous_right_start;          // Raw distance between the two dsb break points (not the fragment ends)
+                    if (overlap > parameter.get_maximum_overlap_fragment_generation() * (blunted_end_gap + 2*parameter.get_P5_adapter_length())) {
+                        // Overlap is large; the section in between these two DSBs is taken to not have been fragmented. No reads produced from this fragment, since it contains 2 P5 adapters.
+                        // right fragment that was already pushed, and skip pushing the current left fragment.
+                        dsb_fragments_right[groupTID].pop_back();
+                        drop_current_left = true;
+                    } else {
+                        // Overlap is small enough: both fragments are shortened to meet near the midpoint of
+                        // their two ends, but with two consecutive end positions rather than sharing a base pair.
+                        long end_sum = left_end + previous_right_end;
+                        long new_right_end;                                        // previous dsb's right fragment new end (the smaller of the two)
+                        long new_left_end;                                         // current dsb's left fragment new end (the larger of the two)
+                        if (end_sum % 2 != 0) {
+                            // Mean is not an integer: use the two integers either side of it.
+                            new_right_end = end_sum / 2;
+                            new_left_end = new_right_end + 1;
+                        } else {
+                            // Mean is an integer: one fragment gets that exact position, the other is 1bp away.
+                            // Which fragment gets the exact position alternates with the parity of the mean, so
+                            // neither the left nor the right fragments are systematically longer.
+                            long mean = end_sum / 2;
+                            if (mean % 2 == 0) {
+                                new_right_end = mean;
+                                new_left_end = mean + 1;
+                            } else {
+                                new_left_end = mean;
+                                new_right_end = mean - 1;
+                            }
+                        }
+                        left_end = new_left_end;
 
-                    // Re-check and re-push the previous right fragment with its new (shortened) end
-                    dsb_fragments_right[groupTID].pop_back();
-                    if (merged_end - previous_right_start + parameter.get_P5_adapter_length() + 1 >= parameter.get_first_size_filter()) {
-                        dsb_fragments_right[groupTID].push_back({previous_right_start, merged_end, previous_chrom_idx, previous_right_dsb_strand1, previous_right_dsb_strand2});
+                        // Re-push the previous right fragment with its new (shortened) end. Size filtering happens
+                        // later, in filter_fragments_size, once all fragments have been generated.
+                        dsb_fragments_right[groupTID].pop_back();
+                        dsb_fragments_right[groupTID].push_back({previous_right_start, new_right_end, previous_right_dsb_strand1, previous_right_dsb_strand2});
                     }
+                } else {
+                    // No previous fragment was actually kept (e.g. it was too short to be a fragment at all):
+                    // its territory still shouldn't be encroached on.
+                    left_end = previous_right_end;
                 }
             }
 
-            if (!drop_current_left && left_start - left_end + parameter.get_P5_adapter_length() + 1 >= parameter.get_first_size_filter()) {
-                dsb_fragments_left[groupTID].push_back({left_start, left_end, chrom_idx, left_dsb_strand1, left_dsb_strand2});
+            if (!drop_current_left) {
+                dsb_fragments_left[groupTID].push_back({left_start, left_end, left_dsb_strand1, left_dsb_strand2});
             }
         }
 
@@ -304,31 +365,22 @@ void InduceSeq::get_dsb_fragments(int groupTID, int threadID) {
         long right_start = dsb_blunted_end[1];
         long right_end = right_start + fragment_length - 1;
         bool right_appended = false;
-        if (fragment_length > 1) {
-            int chrom_end = (*sdd_data.get_chrom_end_loc())[chrom_idx + 1];
-            // std::cout << "chrom end: " <<chrom_end << "  right_end: " << right_end << "\n";
-            if (right_end > chrom_end) right_end = chrom_end;
-
-            // Check whether this right fragment runs into the next dsb's left blunted end (plus the adapter length).
-            // If so, drop this right fragment and remember to also skip the next dsb's left fragment.
-            bool overlaps_next_dsb = false;
-            if (i + 1 < dsb_blunted_ends[groupTID].size()) {
-                const std::vector<long>& next_dsb_blunted_end = dsb_blunted_ends[groupTID][i+1];
-                if (chrom_idx == next_dsb_blunted_end[2] && right_end > next_dsb_blunted_end[0] + parameter.get_P5_adapter_length()) {
-                    overlaps_next_dsb = true;
-                    skip_left_fragment = true;
-                }
-            }
-
-            if (!overlaps_next_dsb && right_end - right_start + parameter.get_P5_adapter_length() + 1 >= parameter.get_first_size_filter()) {
-                dsb_fragments_right[groupTID].push_back({right_start, right_end, chrom_idx, right_dsb_strand1, right_dsb_strand2});
+        bool is_last = (i + 1 == blunted_ends.size());
+        if (fragment_length > 1 && !is_last) {
+            // Check whether this right fragment runs into the next entry's left blunted end (plus the adapter length).
+            // If so, drop this right fragment and remember to also skip the next entry's left fragment.
+            const std::vector<long>& next_dsb_blunted_end = blunted_ends[i+1];
+            bool overlaps_next_dsb = right_end > next_dsb_blunted_end[0] + parameter.get_P5_adapter_length();
+            if (overlaps_next_dsb) {
+                skip_left_fragment = true;
+            } else {
+                dsb_fragments_right[groupTID].push_back({right_start, right_end, right_dsb_strand1, right_dsb_strand2});
                 right_appended = true;
             }
         }
 
         previous_right_start = right_start;
         previous_right_end = right_end;
-        previous_chrom_idx = chrom_idx;
         previous_right_dsb_strand1 = right_dsb_strand1;
         previous_right_dsb_strand2 = right_dsb_strand2;
         previous_right_appended = right_appended;
@@ -341,15 +393,29 @@ void InduceSeq::get_dsb_fragments(int groupTID, int threadID) {
     // std::cout << "DSB fragments left for groupTID=" << groupTID << " (" << frags_left.size() << " entries):\n";
     // for (size_t j = 0; j < frags_left.size(); j++) {
     //     std::cout << "  [" << j << "] start=" << frags_left[j][0]
-    //               << "  end="   << frags_left[j][1]
-    //               << "  chrom=" << frags_left[j][2] << "\n";
+    //               << "  end="   << frags_left[j][1] << "\n";
     // }
     // std::cout << "DSB fragments right for groupTID=" << groupTID << " (" << frags_right.size() << " entries):\n";
     // for (size_t j = 0; j < frags_right.size(); j++) {
     //     std::cout << "  [" << j << "] start=" << frags_right[j][0]
-    //               << "  end="   << frags_right[j][1]
-    //               << "  chrom=" << frags_right[j][2] << "\n";
+    //               << "  end="   << frags_right[j][1] << "\n";
     // }
+}
+
+// Removes fragments from dsb_fragments_left[groupTID] and dsb_fragments_right[groupTID] that are shorter than
+// parameter.get_first_size_filter() once the P5 adapter is accounted for. get_dsb_fragments appends every
+// fragment it generates unfiltered, so that overlap handling between neighbouring fragments always sees the
+// true previous fragment rather than treating one dropped for being too short as if it were never generated.
+void InduceSeq::filter_fragments_size(int groupTID) {
+    std::vector<std::vector<long>>& frags_left = dsb_fragments_left[groupTID];
+    frags_left.erase(std::remove_if(frags_left.begin(), frags_left.end(), [this](const std::vector<long>& frag) {
+        return frag[0] - frag[1] + parameter.get_P5_adapter_length() + 1 < parameter.get_first_size_filter();
+    }), frags_left.end());
+
+    std::vector<std::vector<long>>& frags_right = dsb_fragments_right[groupTID];
+    frags_right.erase(std::remove_if(frags_right.begin(), frags_right.end(), [this](const std::vector<long>& frag) {
+        return frag[1] - frag[0] + parameter.get_P5_adapter_length() + 1 < parameter.get_first_size_filter();
+    }), frags_right.end());
 }
 
 
@@ -418,7 +484,7 @@ void InduceSeq::filter_dsb_strands_ssd(int groupTID) {
     while (i < dsb_fragments_left[groupTID].size()) {
         std::vector<long> dsb_frag = dsb_fragments_left[groupTID][i];
         long frag_end = dsb_frag[1];
-        long causing_break = dsb_frag[3];                                          // backbone1 break that formed this dsb
+        long causing_break = dsb_frag[2];                                          // backbone1 break that formed this dsb
 
         bool is_good = true;
 
@@ -448,7 +514,7 @@ void InduceSeq::filter_dsb_strands_ssd(int groupTID) {
         std::vector<long> dsb_frag = dsb_fragments_right[groupTID][i];
         long frag_start = dsb_frag[0];
         long frag_end = dsb_frag[1];
-        long causing_break = dsb_frag[4];                                          // strand2 location of the dsb that caused the right edge
+        long causing_break = dsb_frag[3];                                          // strand2 location of the dsb that caused the right edge
 
         bool is_good = true;
 
@@ -478,14 +544,12 @@ void InduceSeq::filter_dsb_strands_ssd(int groupTID) {
     std::cerr << "DSB strands left for groupTID=" << groupTID << " (" << strands_left.size() << " entries):\n";
     for (size_t j = 0; j < strands_left.size(); j++) {
         std::cerr << "  [" << j << "] start=" << strands_left[j][0]
-                  << "  end="   << strands_left[j][1]
-                  << "  chrom=" << strands_left[j][2] << "\n";
+                  << "  end="   << strands_left[j][1] << "\n";
     }
     std::cerr << "DSB strands right for groupTID=" << groupTID << " (" << strands_right.size() << " entries):\n";
     for (size_t j = 0; j < strands_right.size(); j++) {
         std::cerr << "  [" << j << "] start=" << strands_right[j][0]
-                  << "  end="   << strands_right[j][1]
-                  << "  chrom=" << strands_right[j][2] << "\n";
+                  << "  end="   << strands_right[j][1] << "\n";
     }
 }
 
@@ -583,9 +647,13 @@ void InduceSeq::generate_simulation_output(int cell_number, int groupTID, int nu
             bp_damages = base_pair_damages_right[groupTID][i - dsb_strands_left[groupTID].size()];
             is_left = false;
         }
+        // Chromosome identity isn't carried through the pipeline (see get_dsb_fragments); this is the one place
+        // it's actually needed, so it's looked up here from dsb_strand[0], the fragment's end nearest to the
+        // dsb that caused it, which is guaranteed to sit well within the correct chromosome.
+        int chrom_idx = get_chrom_idx(dsb_strand[0]);
 
         if (parameter.get_output_sequenced_dsbs()) {
-            std::string dsb_data = std::to_string(dsb_strand[0])+","+std::to_string(dsb_strand[1])+","+std::to_string(dsb_strand[2])+","+std::to_string(is_left)+","+std::to_string(dsb_strand[3])+","+std::to_string(dsb_strand[4])+","+std::to_string(i)+"\n";
+            std::string dsb_data = std::to_string(dsb_strand[0])+","+std::to_string(dsb_strand[1])+","+std::to_string(chrom_idx)+","+std::to_string(is_left)+","+std::to_string(dsb_strand[2])+","+std::to_string(dsb_strand[3])+","+std::to_string(i)+"\n";
             dsb_batch_buffer[localTID].push_back(dsb_data);                         // Add the DSB data to the buffer vector of the respective thread
 
             if (dsb_batch_buffer[localTID].size() >= static_cast<size_t>(batchSize_thread)) {// Check if the batch buffer is full, and write it to the file if needed.
@@ -596,15 +664,15 @@ void InduceSeq::generate_simulation_output(int cell_number, int groupTID, int nu
             }
         }
 
-        get_dna_sequence(dna_seq, bp_damages, dsb_strand, is_left);
+        get_dna_sequence(dna_seq, bp_damages, dsb_strand, is_left, chrom_idx);
         // std::cout << dna_seq << "\n";
         read1.generate_read_with_indel_from_frag(dna_seq, threadID);                                   // Make a read with random indel errors
         std::vector<short> read1_quality_score_vec;                                 // Vector to hold the quality scores for read 1
         read1.get_read_quality(read1_quality_score_vec, 1, threadID);               // Get the read quality scores for the read positions
         read1.add_baseCall_error(read1_quality_score_vec, threadID);                // Add base call errors to the read based on the quality scores
-        
+
         //BBBB
-        std::string chromID = chrom_headers[dsb_strand[2]];                  
+        std::string chromID = chrom_headers[chrom_idx];
         std::string read_data = "@"+chromID+"_read"+std::to_string(i)+"\n";                           // @readID
         read_data += (*read1.get_final_read_sequence(threadID))+ "\n+\n";           // read sequence and +
         for(size_t k=0; k<(*read1.get_final_read_sequence(threadID)).size(); k++){  // read quality scores; insert only as many quality values as with the length of sequence
@@ -646,8 +714,7 @@ void InduceSeq::generate_simulation_output(int cell_number, int groupTID, int nu
     }
 }
 
-void InduceSeq::get_dna_sequence(std::string& dna_seq, std::vector<long>& bp_damages, std::vector<long>& dsb_strand, bool is_left) {
-    int chrom_idx = dsb_strand[2];
+void InduceSeq::get_dna_sequence(std::string& dna_seq, std::vector<long>& bp_damages, std::vector<long>& dsb_strand, bool is_left, int chrom_idx) {
     long start_char_i = dsb_strand[0] + cum_chrom_header_sizes[chrom_idx] - 1;
     long end_char_i = dsb_strand[1] + cum_chrom_header_sizes[chrom_idx] - 1;
 

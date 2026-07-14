@@ -20,9 +20,10 @@ public:
     void find_DSBs(int DSBthreshold, int groupTID);                                  // function to find DSBs from backbone breaks on opposite strands within a threshold and on the same chromosome
     void get_blunted_ends(int groupTID);                                             // function to determine blunted ends from the DSB locations
     void get_dsb_fragments(int groupTID, int threadID);                              // function to get the DSB fragments from the blunted ends
+    void filter_fragments_size(int groupTID);                                        // function to remove DSB fragments shorter than the first size filter
     void filter_dsb_strands_ssd(int groupTID);                                       // function to filter DSB strands by single-strand damage
     void find_base_pair_damages(int groupTID);                                       // function to find base pair damages on the DSB strands
-    void get_dna_sequence(std::string& dna_seq, std::vector<long>& bp_damages, std::vector<long>& dsb_strand, bool is_left);  // function to extract the DNA sequence for a DSB strand from the genome
+    void get_dna_sequence(std::string& dna_seq, std::vector<long>& bp_damages, std::vector<long>& dsb_strand, bool is_left, int chrom_idx);  // function to extract the DNA sequence for a DSB strand from the genome
     void generate_simulation_output(int cell_number, int groupTID, int num_available_threads, int threadIDOffset);  // function to induce sequencing from DSB fragments
     void run_simulation(int cell_number, int groupTID, int threadID, int NworkerThreads, int threadIDOffset);
     std::vector<std::vector<long>>& get_dsb_locations(int groupTID);                 // function to get the DSB locations
@@ -31,8 +32,9 @@ public:
 
 private:
     void set_fragment_size_distribution_from_file();                                 // function to read the induce_seq fragment size distribution file and populate fragment_size_distribution
+    int get_chrom_idx(long position);                                                 // function to find the chromosome index (0-based) that a global bp position falls within, via binary search over chrom_end_loc
 
-    std::vector<std::vector<std::vector<long>>> dsb_locations;                       // Stores double strand breaks. First index is groupTID, each element is a list of [backbone1_site, backbone2_site, chrom indx]. chrom indx starts from 0, 1, 2, ...
+    std::vector<std::vector<std::vector<long>>> dsb_locations;                       // Stores double strand breaks. First index is groupTID, each element is [backbone1_site, backbone2_site, prevStepDSB]. Chromosome identity is not tracked; find_DSBs treats chromosome boundaries as breaks in both strands, so it is computed only transiently there, and again via get_chrom_idx wherever it is actually needed (e.g. generate_simulation_output)
     std::vector<std::vector<std::vector<long>>> dsb_blunted_ends;                    // Stores blunted DSB ends. First index is groupTID
     std::vector<std::vector<std::vector<long>>> dsb_fragments_left;                  // Stores left DSB fragments. First index is groupTID
     std::vector<std::vector<std::vector<long>>> dsb_fragments_right;                 // Stores right DSB fragments. First index is groupTID
